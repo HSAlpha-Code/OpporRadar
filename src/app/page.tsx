@@ -83,6 +83,7 @@ export default function Home() {
   const [currentStep, setCurrentStep] = useState<
     "idle" | "understanding" | "searching" | "reading" | "matching" | "done"
   >("idle");
+  const [stepNumber, setStepNumber] = useState<number>(0);
   const [statusMessage, setStatusMessage] = useState("");
   const [extractedKeywords, setExtractedKeywords] = useState<string[]>([]);
   const [activeReadingPages, setActiveReadingPages] = useState<{ url: string; sourceName?: string }[]>([]);
@@ -138,7 +139,7 @@ export default function Home() {
     }
   };
 
-  // Run Radar pipeline
+  // Run Radar pipeline via decoupled trigger and polling
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!lookingFor.trim() || !profile.trim()) {
@@ -151,11 +152,13 @@ export default function Home() {
     setOpportunities([]);
     setExtractedKeywords([]);
     setActiveReadingPages([]);
+    setStepNumber(0);
     setCurrentStep("understanding");
-    setStatusMessage("Understanding your background and goals...");
+    setStatusMessage("Triggering background discovery pipeline...");
 
     try {
-      const response = await fetch("/api/radar", {
+      // 1. Trigger asynchronous job
+      const triggerRes = await fetch("/api/radar/trigger", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -165,76 +168,90 @@ export default function Home() {
         }),
       });
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => null);
-        throw new Error(errorData?.message || `Server returned status ${response.status}`);
+      if (!triggerRes.ok) {
+        const errorData = await triggerRes.json().catch(() => null);
+        throw new Error(
+          errorData?.error || errorData?.message || `Server returned status ${triggerRes.status}`
+        );
       }
 
-      if (!response.body) {
-        throw new Error("ReadableStream not available");
-      }
+      const { jobId } = await triggerRes.json();
+      console.log(`[Radar UI] Job triggered with ID: ${jobId}. Beginning status polling...`);
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+      // 2. Poll job status until COMPLETED or FAILED
+      const pollIntervalMs = 1500;
+      let isCompleted = false;
+      let consecutiveErrors = 0;
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+      while (!isCompleted) {
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
 
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() || "";
+        try {
+          const statusRes = await fetch(
+            `/api/radar/status?jobId=${encodeURIComponent(jobId)}`,
+            { cache: "no-store" }
+          );
 
-        for (const evt of events) {
-          if (!evt.trim()) continue;
-
-          let eventName = "message";
-          let dataStr = "";
-
-          const lines = evt.split("\n");
-          for (const line of lines) {
-            if (line.startsWith("event: ")) {
-              eventName = line.replace("event: ", "").trim();
-            } else if (line.startsWith("data: ")) {
-              dataStr = line.replace("data: ", "").trim();
+          if (!statusRes.ok) {
+            consecutiveErrors++;
+            if (consecutiveErrors > 15) {
+              throw new Error("Unable to fetch job progress from server.");
             }
+            continue;
           }
 
-          if (dataStr) {
-            try {
-              const parsed = JSON.parse(dataStr);
+          consecutiveErrors = 0;
+          const job = await statusRes.json();
 
-              if (eventName === "progress") {
-                if (parsed.step) setCurrentStep(parsed.step);
-                if (parsed.message) setStatusMessage(parsed.message);
-                if (parsed.pages) setActiveReadingPages(parsed.pages);
-              } else if (eventName === "step_understanding_done") {
-                if (parsed.understanding?.keywords) {
-                  setExtractedKeywords(parsed.understanding.keywords);
-                }
-              } else if (eventName === "step_reading_done") {
-                if (parsed.sourcesStatus) {
-                  setSourcesSummary(parsed.sourcesStatus);
-                }
-              } else if (eventName === "done") {
-                setCurrentStep("done");
-                setOpportunities(parsed.opportunities || []);
-                if (parsed.sourcesSummary) {
-                  setSourcesSummary(parsed.sourcesSummary);
-                }
-                setLoading(false);
+          if (job.stepNumber !== undefined) setStepNumber(job.stepNumber);
+          if (job.progressMessage) setStatusMessage(job.progressMessage);
+          if (job.extractedKeywords && job.extractedKeywords.length > 0) {
+            setExtractedKeywords(job.extractedKeywords);
+          }
+          if (job.activeReadingPages && job.activeReadingPages.length > 0) {
+            setActiveReadingPages(job.activeReadingPages);
+          }
+          if (job.sourcesSummary) {
+            setSourcesSummary(job.sourcesSummary);
+          }
 
-                setTimeout(() => {
-                  resultsRef.current?.scrollIntoView({ behavior: "smooth" });
-                }, 200);
-              } else if (eventName === "error") {
-                setErrorMessage(parsed.message || "An error occurred");
-                setLoading(false);
-              }
-            } catch (parseErr) {
-              console.error("Error parsing SSE event data:", parseErr);
-            }
+          // Map pipeline state to UI stages
+          switch (job.status) {
+            case "PENDING":
+            case "GENERATING_QUERIES":
+              setCurrentStep("understanding");
+              break;
+            case "GATHERING_LINKS":
+            case "TRIAGING":
+              setCurrentStep("searching");
+              break;
+            case "FETCHING_CONTENT":
+              setCurrentStep("reading");
+              break;
+            case "EXTRACTING_OPPORTUNITIES":
+              setCurrentStep("matching");
+              break;
+            case "COMPLETED":
+              setCurrentStep("done");
+              setOpportunities(job.opportunities || []);
+              setLoading(false);
+              isCompleted = true;
+
+              setTimeout(() => {
+                resultsRef.current?.scrollIntoView({ behavior: "smooth" });
+              }, 200);
+              break;
+            case "FAILED":
+              setErrorMessage(job.error || job.progressMessage || "Pipeline execution failed.");
+              setLoading(false);
+              isCompleted = true;
+              break;
+          }
+        } catch (pollErr: any) {
+          console.warn("[Radar UI] Polling tick error:", pollErr.message);
+          consecutiveErrors++;
+          if (consecutiveErrors > 15) {
+            throw pollErr;
           }
         }
       }
@@ -244,7 +261,7 @@ export default function Home() {
       if (friendly.includes("401")) friendly = "Your API key looks wrong. Please check .env.local";
       if (friendly.includes("429")) friendly = "Too many requests, wait a minute";
       if (friendly.includes("402")) friendly = "Daily free limit reached";
-      if (friendly.includes("fetch") || friendly.includes("network")) friendly = "Couldn't reach TinyFish";
+      if (friendly.includes("fetch") || friendly.includes("network")) friendly = "Couldn't reach TinyFish or server endpoints";
       setErrorMessage(friendly);
       setLoading(false);
     }
@@ -510,6 +527,20 @@ export default function Home() {
               <span className="text-xs text-slate-500 dark:text-slate-400">
                 {statusMessage}
               </span>
+            </div>
+
+            {/* Real-time Progress Bar */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs font-semibold text-slate-600 dark:text-slate-300">
+                <span>Phase Progress ({stepNumber}/6 Steps)</span>
+                <span>{Math.min(100, Math.round((stepNumber / 6) * 100))}%</span>
+              </div>
+              <div className="w-full h-2.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-indigo-500 to-violet-600 rounded-full transition-all duration-500 ease-out"
+                  style={{ width: `${Math.max(5, Math.min(100, Math.round((stepNumber / 6) * 100)))}%` }}
+                />
+              </div>
             </div>
 
             {/* Stepper tracker */}
