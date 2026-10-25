@@ -217,7 +217,7 @@ export class TinyFishClient {
         concurrencyLimiter.run(async () => {
           const executeBatch = async (attempt: number): Promise<Response> => {
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 150000); // 150s timeout
+            const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout per batch
             try {
               const res = await fetch(this.fetchUrl, {
                 method: "POST",

@@ -170,10 +170,7 @@ export async function runOpportunityPipeline(
     // ----------------------------------------------------
     const pagesToFetchMap = new Map<string, string>(); // url -> sourceName
 
-    for (const item of listingUrls) {
-      pagesToFetchMap.set(item.url, item.sourceName);
-    }
-
+    // Prioritize AI-triaged specific opportunity pages (highest signal)
     for (const item of triagedResults) {
       let domain = "";
       try {
@@ -185,7 +182,15 @@ export async function runOpportunityPipeline(
       pagesToFetchMap.set(item.url, matchedSource ? matchedSource.name : domain);
     }
 
-    const allUrlsToFetch = Array.from(pagesToFetchMap.keys());
+    // Add top 2-3 primary category portal listing URLs
+    for (const item of listingUrls.slice(0, 3)) {
+      if (!pagesToFetchMap.has(item.url)) {
+        pagesToFetchMap.set(item.url, item.sourceName);
+      }
+    }
+
+    // Limit to max 10 URLs total for fast serverless execution
+    const allUrlsToFetch = Array.from(pagesToFetchMap.keys()).slice(0, 10);
     const activeReadingPages = allUrlsToFetch.map((u) => ({
       url: u,
       sourceName: pagesToFetchMap.get(u),
@@ -193,7 +198,7 @@ export async function runOpportunityPipeline(
 
     await jobStore.updateJob(jobId, {
       status: "FETCHING_CONTENT",
-      progressMessage: `Step 4/6: Reading and extracting text from ${allUrlsToFetch.length} opportunity portals...`,
+      progressMessage: `Step 4/6: Reading and extracting text from ${allUrlsToFetch.length} top opportunity portals...`,
       stepNumber: 4,
       activeReadingPages,
     });
@@ -246,25 +251,34 @@ export async function runOpportunityPipeline(
       stepNumber: 5,
     });
 
-    const extractionPromises: Promise<ExtractedOpportunity[]>[] = [];
-
-    for (const [url, sourceName] of pagesToFetchMap.entries()) {
+    // Filter to top 8 highest quality pages with meaningful content (>= 200 chars)
+    const eligiblePages: { url: string; sourceName: string; text: string }[] = [];
+    for (const url of allUrlsToFetch) {
       const page = fetchedPagesMap.get(url);
-      if (page && page.text && page.text.length >= 100) {
-        extractionPromises.push(
-          extractOpportunitiesFromPage({
-            pageUrl: url,
-            sourceName,
-            pageText: page.text,
-            keywords: understanding.keywords,
-            profile,
-          }).then((opps) => {
-            console.log(`[Pipeline ${jobId}] Extracted ${opps.length} opportunities from ${sourceName}`);
-            return opps;
-          })
-        );
+      if (page && page.text && page.text.length >= 200) {
+        eligiblePages.push({
+          url,
+          sourceName: pagesToFetchMap.get(url) || "Portal",
+          text: page.text,
+        });
       }
     }
+
+    const pagesToExtract = eligiblePages.slice(0, 8);
+    console.log(`[Pipeline ${jobId}] Extracting in parallel from ${pagesToExtract.length} high-potential pages...`);
+
+    const extractionPromises = pagesToExtract.map((item) =>
+      extractOpportunitiesFromPage({
+        pageUrl: item.url,
+        sourceName: item.sourceName,
+        pageText: item.text,
+        keywords: understanding.keywords,
+        profile,
+      }).then((opps) => {
+        console.log(`[Pipeline ${jobId}] Extracted ${opps.length} opportunities from ${item.sourceName}`);
+        return opps;
+      })
+    );
 
     const extractedBatches = await Promise.all(extractionPromises);
     const allExtracted: ExtractedOpportunity[] = extractedBatches.flat();

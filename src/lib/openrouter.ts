@@ -54,7 +54,7 @@ class ConcurrencyLimiter {
   }
 }
 
-const openRouterLimiter = new ConcurrencyLimiter(4);
+const openRouterLimiter = new ConcurrencyLimiter(8);
 
 function getOpenRouterApiKey(): string {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -71,7 +71,6 @@ function getModelName(): string {
 function parseJsonSafe<T>(rawText: string, fallback: T): T {
   try {
     let clean = rawText.trim();
-    // Remove markdown json code fences if present
     if (clean.includes("```json")) {
       const match = clean.match(/```json\s*([\s\S]*?)\s*```/i);
       if (match && match[1]) {
@@ -84,23 +83,42 @@ function parseJsonSafe<T>(rawText: string, fallback: T): T {
       }
     }
 
-    // If still contains leading/trailing non-json chars, find first { or [ and last } or ]
-    const firstBrace = clean.indexOf("{");
-    const firstBracket = clean.indexOf("[");
-    const startIdx =
-      firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)
-        ? firstBrace
-        : firstBracket;
+    // Direct JSON parse attempt
+    try {
+      return JSON.parse(clean);
+    } catch {}
 
-    const lastBrace = clean.lastIndexOf("}");
-    const lastBracket = clean.lastIndexOf("]");
-    const endIdx = Math.max(lastBrace, lastBracket);
-
-    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-      clean = clean.slice(startIdx, endIdx + 1);
+    // Handle multiple empty arrays like "[]\n[]" or "[] []"
+    if (/^(\s*\[\s*\]\s*)+$/.test(clean)) {
+      return [] as unknown as T;
     }
 
-    return JSON.parse(clean);
+    // Extract all JSON arrays and combine them
+    const arrayMatches = Array.from(clean.matchAll(/\[([\s\S]*?)\]/g));
+    if (arrayMatches.length > 0) {
+      const combined: any[] = [];
+      let foundValid = false;
+      for (const m of arrayMatches) {
+        try {
+          const parsed = JSON.parse(`[${m[1]}]`);
+          if (Array.isArray(parsed)) {
+            combined.push(...parsed);
+            foundValid = true;
+          }
+        } catch {}
+      }
+      if (foundValid) return combined as unknown as T;
+    }
+
+    // Extract first valid JSON object
+    const objMatch = clean.match(/\{[\s\S]*?\}/);
+    if (objMatch) {
+      try {
+        return JSON.parse(objMatch[0]);
+      } catch {}
+    }
+
+    return fallback;
   } catch (err: any) {
     console.error(
       "[OpenRouter parseJsonSafe] Failed to parse JSON:",
@@ -120,7 +138,7 @@ async function callOpenRouter(prompt: string, systemPrompt?: string): Promise<st
   const model = getModelName();
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+  const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s timeout
 
   try {
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -314,7 +332,7 @@ export async function extractOpportunitiesFromPage(params: {
 
   return openRouterLimiter.run(async () => {
     const today = new Date().toISOString().split("T")[0];
-    const textSample = pageText.slice(0, 20000);
+    const textSample = pageText.slice(0, 8000);
 
     const prompt = `You are an expert opportunity parser for Indian college students.
 Source Name: ${sourceName}
